@@ -1,0 +1,117 @@
+# Publica uma versão do Peek a partir daqui, neste repositório PÚBLICO (o Actions de repositório público é gratuito), usando o código
+# do repositório privado pedrotonidandel/docky. É o mesmo "Lançamento" do docky, com o checkout trocado: serve quando o Actions do
+# docky não inicia (limite de minutos ou cobrança da conta).
+#
+# Como usar: o código com a tag (ex.: v0.12.0) já tem de estar no docky. Aqui, Actions > Lançamento > Run workflow e a tag.
+# Ele baixa o código do docky por uma deploy key SOMENTE LEITURA (secret DOCKY_DEPLOY_KEY), compila os instaladores do Windows
+# e do macOS, assina e cria a release aqui, com o latest.json que o app lê para se atualizar.
+#
+# Secrets deste repositório: DOCKY_DEPLOY_KEY, TAURI_SIGNING_PRIVATE_KEY, LUME_GOOGLE_CLIENT_ID, LUME_GOOGLE_CLIENT_SECRET,
+# LUME_MICROSOFT_CLIENT_ID. (O GITHUB_TOKEN padrão já escreve aqui; não precisa de RELEASES_TOKEN.)
+name: Lançamento
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "A tag do código no repositório docky (ex.: v0.12.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  instalador:
+    strategy:
+      fail-fast: false
+      # Um de cada vez: os dois criariam a mesma release ao mesmo tempo e um deles falharia.
+      max-parallel: 1
+      matrix:
+        include:
+          - nome: macOS
+            os: macos-latest
+            args: "--target universal-apple-darwin"
+            alvos: "aarch64-apple-darwin,x86_64-apple-darwin"
+          - nome: Windows
+            os: windows-latest
+            args: ""
+            alvos: ""
+    name: ${{ matrix.nome }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: pedrotonidandel/docky
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.DOCKY_DEPLOY_KEY }}
+          # O histórico inteiro e as tags: as notas da versão saem dos commits entre uma tag e outra.
+          fetch-depth: 0
+
+      - name: A tag bate com a versão do app, e os segredos estão aqui?
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          MS: ${{ secrets.LUME_MICROSOFT_CLIENT_ID }}
+          GOOGLE: ${{ secrets.LUME_GOOGLE_CLIENT_ID }}
+          CHAVE: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          versao="$(node -p "require('./package.json').version")"
+          if [ "${TAG}" != "v${versao}" ]; then
+            echo "A tag ${TAG} não bate com a versão ${versao} do package.json."
+            exit 1
+          fi
+          # Sem estes, a versão sairia sem login do Google ou do Outlook, ou sem poder assinar a atualização.
+          for v in MS GOOGLE CHAVE; do
+            if [ -z "${!v}" ]; then echo "Falta o secret de ${v}."; exit 1; fi
+          done
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.alvos }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      # As notas desta versão, geradas dos commits (scripts/notas-da-versao.mjs): vão para dentro do app (src/notas/notas.json)
+      # e para o corpo da release, que o aviso de atualização também mostra.
+      - name: Notas da versão
+        id: notas
+        shell: bash
+        run: |
+          node scripts/notas-da-versao.mjs
+          {
+            echo 'corpo<<NOTAS_FIM'
+            node scripts/notas-da-versao.mjs --markdown
+            echo 'NOTAS_FIM'
+          } >> "$GITHUB_OUTPUT"
+
+      - run: npm test
+        if: matrix.nome == 'Windows'
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          LUME_GOOGLE_CLIENT_ID: ${{ secrets.LUME_GOOGLE_CLIENT_ID }}
+          LUME_GOOGLE_CLIENT_SECRET: ${{ secrets.LUME_GOOGLE_CLIENT_SECRET }}
+          LUME_MICROSOFT_CLIENT_ID: ${{ secrets.LUME_MICROSOFT_CLIENT_ID }}
+        with:
+          args: ${{ matrix.args }}
+          tagName: ${{ inputs.tag }}
+          # A tag nasce aqui, onde o commit do código não existe: parte da main deste repositório.
+          releaseCommitish: main
+          releaseName: "Peek ${{ inputs.tag }}"
+          releaseBody: ${{ steps.notas.outputs.corpo }}
+          releaseDraft: false
+          prerelease: false
+          # Gera o latest.json que o app consulta (e o sobe junto do instalador).
+          includeUpdaterJson: true
